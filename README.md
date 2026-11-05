@@ -15,8 +15,9 @@ This fork adds relay support for newer Shelly devices, including Shelly 1 Mini G
 
 Tested with real devices on Domoticz 2026.4: automatic creation, relay control from Domoticz and status reporting for Shelly 1 Mini Gen3 and Shelly 2PM Gen4, including PM measurements and a Shelly BLU H&T sensor through the 2PM gateway. Relay changes made directly or through external apps are reflected in Domoticz.
 
-- Set each device's MQTT prefix to `shellies/<device-id>` (unique per device).
-- Enable MQTT, **MQTT Control**, **RPC over MQTT**, **Generic status update over MQTT**, and **RPC status notifications over MQTT** in the device settings. For BLE discovery, use the default Shelly device ID as the final segment of the MQTT prefix (`shellies/<device-id>`); custom aliases are not supported.
+- Set each newer device's MQTT prefix to `shellies/<device-name>` (unique per device), for example `shellies/shelly2pmg4-terra`. The default device ID also works.
+- Enable MQTT, **MQTT Control**, **RPC over MQTT**, **Generic status update over MQTT**, and **RPC status notifications over MQTT** in the device settings.
+- The MQTT prefix forms part of each Domoticz DeviceID. Changing it creates new Domoticz devices rather than renaming the existing ones; existing IDX, history and automation references are not migrated.
 - In Domoticz, allow new devices (the five-minute permission also works) and start or restart the plugin. If no switch appears, toggle the relay so it publishes its status. A failed creation is retried on a later status message, at most once every 15 seconds per switch. The older plugin startup message about hardware creation reflects saved settings and may not reflect the five-minute permission.
 - Back up your existing plugin directory and Domoticz database before replacing the plugin file. This is an unofficial fork, not an upstream release; test on a non-critical relay first.
 
@@ -32,7 +33,7 @@ If you do not have an MQTT server yet, install Mosquitto for example:
 http://mosquitto.org/blog/2013/01/mosquitto-debian-repository/
 
 > [!WARNING]
-> **Older Shelly devices:** Do not enable **Use custom MQTT prefix**; the plugin may not detect the device. Newer devices must use `shellies/<device-id>` as described above.
+> **Older Shelly devices:** Do not enable **Use custom MQTT prefix**; the plugin may not detect the device. Newer devices must use `shellies/<device-name>` as described above.
 
 > [!NOTE]
 > **Shelly Plus H&T:** Set the MQTT prefix to `shellies/` followed by the device ID so it publishes under `shellies/<device-id>`.

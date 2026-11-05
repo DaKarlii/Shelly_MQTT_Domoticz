@@ -365,6 +365,7 @@ class BasePlugin:
         self.ble_pending = {}
         self.ble_refresh = {}
         self.ble_gateways = set()
+        self.ble_gateway_ids = {}
         self.ble_components = {}
         self.ble_values = {}
         self.ble_timestamps = {}
@@ -386,8 +387,10 @@ class BasePlugin:
         request_id = self.ble_rpc_id
         reply = self.base_topic + "/domoticz-" + self.mqttClient.client_id
         now = time.time()
-        self.ble_pending = {key: item for key, item in self.ble_pending.items() if now - item[2] <= 60}
-        self.ble_pending[request_id] = (gateway, offset, now)
+        self.ble_pending = {key: item for key, item in self.ble_pending.items()
+                            if now - item[2] <= 60 and not (offset == 0 and item[0] == gateway)}
+        expected_src = getattr(self, "ble_gateway_ids", {}).get(gateway)
+        self.ble_pending[request_id] = (gateway, offset, now, expected_src)
         if offset == 0:
             if not hasattr(self, "ble_scan"):
                 self.ble_scan = {}
@@ -675,8 +678,13 @@ class BasePlugin:
           pending = getattr(self, "ble_pending", {})
           entry = pending.get(original_message.get("id"))
           if entry:
-           gateway, offset, requested_at = entry
-           if original_message.get("src") != gateway:
+           gateway, offset, requested_at, expected_src = entry
+           reply_src = original_message.get("src")
+           known_src = getattr(self, "ble_gateway_ids", {}).get(gateway)
+           if (not isinstance(reply_src, str) or not reply_src or
+               original_message.get("dst") != self.base_topic + "/domoticz-" + self.mqttClient.client_id or
+               (expected_src is not None and reply_src != expected_src) or
+               (known_src is not None and reply_src != known_src)):
             return True
            if time.time() - requested_at <= 60:
             pending.pop(original_message["id"], None)
@@ -688,8 +696,8 @@ class BasePlugin:
             if isinstance(result, dict) and scan is not None and result.get("offset") == offset and isinstance(result.get("components"), list) and type(result.get("total")) is int and 0 <= offset <= result["total"]:
              revision, total = result.get("cfg_rev"), result["total"]
              if offset == 0:
-              scan["revision"], scan["total"] = revision, total
-             if scan["revision"] != revision or scan["total"] != total:
+              scan["revision"], scan["total"], scan["source"] = revision, total, reply_src
+             if scan["revision"] != revision or scan["total"] != total or scan.get("source") != reply_src:
               Domoticz.Error("BLE component configuration changed during discovery for " + gateway)
               self.ble_scan.pop(gateway, None)
               return True
@@ -736,6 +744,16 @@ class BasePlugin:
            update_new_switch(mqttpath[1], mqttpath[3], original_message)
           return True
          if len(mqttpath) == 4 and mqttpath[2:] == ["events", "rpc"] and isinstance(original_message, dict):
+          source = original_message.get("src")
+          if isinstance(source, str) and source and original_message.get("dst") == self.base_topic + "/" + mqttpath[1] + "/events":
+           if not hasattr(self, "ble_gateway_ids"):
+            self.ble_gateway_ids = {}
+           previous_source = self.ble_gateway_ids.get(mqttpath[1])
+           if previous_source != source:
+            self.ble_gateway_ids[mqttpath[1]] = source
+            if hasattr(self, "ble_refresh") and mqttpath[1] in self.ble_refresh:
+             self.ble_refresh.pop(mqttpath[1], None)
+             self._discover_ble(mqttpath[1])
           if original_message.get("method") in ["NotifyStatus", "NotifyFullStatus"]:
            params = original_message.get("params")
            if isinstance(params, dict):
