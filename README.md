@@ -1,17 +1,28 @@
-[![Code size](https://img.shields.io/github/languages/code-size/enesbcs/shelly_mqtt)]() [![Last commit](https://img.shields.io/github/last-commit/enesbcs/shelly_mqtt)]()
+[![Code size](https://img.shields.io/github/languages/code-size/DaKarlii/Shelly_MQTT_Domoticz)](https://github.com/DaKarlii/Shelly_MQTT_Domoticz) [![Last commit](https://img.shields.io/github/last-commit/DaKarlii/Shelly_MQTT_Domoticz)](https://github.com/DaKarlii/Shelly_MQTT_Domoticz/commits)
 
-# This plugin is free and open source, you can use forever and any purpose you like. But further improvement is stopped.
-# The new script which adds Shelly devices to Domoticz MQTT Autodiscovery hardware is published at https://github.com/enesbcs/shellyteacher4domo and that is currently under development.
+## Private fork
+
+This is a private, unofficial fork of [enesbcs/Shelly_MQTT](https://github.com/enesbcs/Shelly_MQTT). It is maintained for personal use and comes without official support or guarantees. The original plugin is no longer being developed.
+
+The original author is developing a separate script for Domoticz MQTT Autodiscovery: https://github.com/enesbcs/shellyteacher4domo.
 
 # ShellyMQTT - Domoticz Python Plugin
 Python plugin for Shelly relay devices using MQTT protocol
 
-MQTT parts based on heavily on the [zigbee2mqtt] project (https://github.com/stas-demydiuk/domoticz-zigbee2mqtt-plugin) 
-big thanks for it!
+## Local extension: newer Shelly switches
+
+This fork adds relay support for newer Shelly devices, including Shelly 1 Mini Gen3 and Shelly 2PM Gen4 in **switch mode**. Each `switch:<id>` is created as a Domoticz switch; its state comes from `status/switch:<id>` or `NotifyStatus` / `NotifyFullStatus` events. Commands use MQTT Control. When the corresponding fields are reported, separate devices show power and cumulative energy (W and Wh), voltage, current, power factor, frequency and internal temperature per switch channel. Existing Gen1 devices keep their previous device IDs and behavior. Cover mode is not implemented. BTHome gateways can discover a combined temperature/humidity device when exactly one temperature and one humidity component are found for a BLE address; existing dummy devices are not modified. MQTT RPC and status notifications must be enabled.
+
+Tested with real devices on Domoticz 2026.4: automatic creation, relay control from Domoticz and status reporting for Shelly 1 Mini Gen3 and Shelly 2PM Gen4, including PM measurements and a Shelly BLU H&T sensor through the 2PM gateway. Relay changes made directly or through external apps are reflected in Domoticz.
+
+- Set each device's MQTT prefix to `shellies/<device-id>` (unique per device).
+- Enable MQTT, **MQTT Control**, **RPC over MQTT**, **Generic status update over MQTT**, and **RPC status notifications over MQTT** in the device settings. For BLE discovery, use the default Shelly device ID as the final segment of the MQTT prefix (`shellies/<device-id>`); custom aliases are not supported.
+- In Domoticz, allow new devices (the five-minute permission also works) and start or restart the plugin. If no switch appears, toggle the relay so it publishes its status. A failed creation is retried on a later status message, at most once every 15 seconds per switch. The older plugin startup message about hardware creation reflects saved settings and may not reflect the five-minute permission.
+- Back up your existing plugin directory and Domoticz database before replacing the plugin file. This is an unofficial fork, not an upstream release; test on a non-critical relay first.
 
 ## Prerequisites
 
-Tested and works with Domoticz v4.x.
+The original plugin was tested with Domoticz v4.x. This fork has also been tested with Domoticz 2026.4 as described above.
 
 If you do not have a working Python >=3.5 installation, please install it first! ( https://www.domoticz.com/wiki/Using_Python_plugins )
 (if Shelly_MQTT does not appear in HW list after installation, read again the above article!)
@@ -20,16 +31,18 @@ Setup and run MQTT broker and an MQTT capable Shelly device. (http://shelly-api-
 If you do not have an MQTT server yet, install Mosquitto for example:
 http://mosquitto.org/blog/2013/01/mosquitto-debian-repository/
 
-!!! Please, DO NOT CHECK "Use custom MQTT prefix" on your device settings page if you want to use this plugin as this will render device detection unusable !!!
+> [!WARNING]
+> **Older Shelly devices:** Do not enable **Use custom MQTT prefix**; the plugin may not detect the device. Newer devices must use `shellies/<device-id>` as described above.
 
-!!! For Shelly Plus HT, please prefix the MQTT topic with `shellies/` on your device settings page to make it send on the same topic as other devices !!!
+> [!NOTE]
+> **Shelly Plus H&T:** Set the MQTT prefix to `shellies/` followed by the device ID so it publishes under `shellies/<device-id>`.
 
 ## Installation
 
-1. Clone repository into your domoticz plugins folder
-```
+1. Clone this fork into your Domoticz plugins folder:
+```bash
 cd domoticz/plugins
-git clone https://github.com/enesbcs/Shelly_MQTT.git
+git clone https://github.com/DaKarlii/Shelly_MQTT_Domoticz.git
 ```
 2. Restart domoticz
 3. Go to "Hardware" page and add new item with type "ShellyMQTT"
@@ -40,8 +53,7 @@ Once plugin receive any MQTT message from Shelly it will try to create appropria
 
 ## Plugin install&update with plugin manager
 
-I suggest to use a plugin manager for easy updates through Domoticz GUI:
-https://github.com/stas-demydiuk/domoticz-plugins-manager
+[Domoticz Plugins Manager](https://github.com/stas-demydiuk/domoticz-plugins-manager) can manage plugins through the Domoticz GUI. Check that it is configured to use this fork; an upstream entry may install or update the original plugin instead.
 
 ## Plugin manual update
 
@@ -50,14 +62,19 @@ Warning: if you use this method, Domoticz may duplicate devices after it!
 1. Stop domoticz
 2. Go to plugin folder and pull new version
 ```
-cd domoticz/plugins/Shelly_MQTT
+cd domoticz/plugins/Shelly_MQTT_Domoticz
 git pull
 ```
 3. Start domoticz
 
 ## Supported devices
 
-Tested and working with:
+Tested in this fork on Domoticz 2026.4:
+ - Shelly 1 Mini Gen3 (device discovery, relay control and status reporting)
+ - Shelly 2PM Gen4 in switch mode (device discovery, relay control, status reporting and PM measurements)
+ - Shelly BLU H&T sensor via the 2PM Gen4 BTHome gateway (temperature, humidity and battery)
+
+The original project lists the following devices as tested and working:
  - Shelly 1 Open Source (relay)
  - Shelly 1PM (relay)*
  - Shelly Plug (relay)*
@@ -84,4 +101,12 @@ Tested and working with:
 
 *Power consumption can be enabled in the plugin settings page manually, it's an optional feature without any further support
 
-**I would like to thank [Allterco Robotics](https://allterco.com/en/Shelly) for providing me with samples of Shelly Plug/Shelly2/Shelly4/Shelly RGBW2/Shelly Dimmer2/Shelly Bulb Duo/Shelly i3/Shelly Motion to support the development of this plugin.**
+## Contributing
+
+Issues and pull requests are welcome at [this fork](https://github.com/DaKarlii/Shelly_MQTT_Domoticz). This is a personal project, so there is no guaranteed support or response time.
+
+## Acknowledgements
+
+Thanks to the original author and contributors of [Shelly_MQTT](https://github.com/enesbcs/Shelly_MQTT). Its MQTT implementation was heavily based on the [Domoticz Zigbee2MQTT plugin](https://github.com/stas-demydiuk/domoticz-zigbee2mqtt-plugin).
+
+The original author also thanked [Allterco Robotics](https://allterco.com/en/Shelly) for providing Shelly device samples that supported development of the original plugin.
