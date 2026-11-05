@@ -71,8 +71,9 @@ except Exception as e:
  errmsg += " time import error: "+str(e)
 try:
  import re
+ import math
 except Exception as e:
- errmsg += " re import error: "+str(e)
+ errmsg += " re or math import error: "+str(e)
 try:
  from mqtt import MqttClientSH2
 except Exception as e:
@@ -154,6 +155,19 @@ class BasePlugin:
         if self.mqttClient is None:
          return False
         Domoticz.Debug("Command: " + Command + " (" + str(Level) + ") Color:" + Color)
+        # Newer Shelly switches have their own DeviceID so old relay commands stay unchanged.
+        device = Devices.get(Unit)
+        if device is not None:
+         switch = re.fullmatch(r"(.+)-switch-(0|[1-9][0-9]*)", device.DeviceID.strip())
+         if switch:
+          cmd = Command.strip().lower()
+          if cmd in ["on", "off"]:
+           topic = self.base_topic + "/" + switch.group(1) + "/command/switch:" + switch.group(2)
+           try:
+            self.mqttClient.publish(topic, cmd)
+           except Exception as e:
+            Domoticz.Error("Cannot send switch command: " + str(e))
+          return
         device_id = ""
         try:
          device = Devices[Unit]
@@ -341,18 +355,70 @@ class BasePlugin:
             self.mqttClient._open()
         else:
             self.mqttClient.ping()
+            for gateway in list(getattr(self, "ble_gateways", set())):
+                self._discover_ble(gateway)
        except Exception as e:
         Domoticz.Error(str(e))
 
     def onMQTTConnected(self):
        if self.mqttClient is not None:
+        self.ble_pending = {}
+        self.ble_refresh = {}
+        self.ble_gateways = set()
+        self.ble_components = {}
+        self.ble_values = {}
+        self.ble_timestamps = {}
+        self.ble_arrivals = {}
+        self.ble_scan = {}
         self.mqttClient.subscribe([self.base_topic + '/#'])
 
     def onMQTTDisconnected(self):
         Domoticz.Debug("onMQTTDisconnected")
 
+    def _request_ble_components(self, gateway, offset=0):
+        if self.mqttClient is None:
+            return
+        if not hasattr(self, "ble_pending"):
+            self.ble_pending, self.ble_refresh = {}, {}
+        if not hasattr(self, "ble_rpc_id"):
+            self.ble_rpc_id = 0
+        self.ble_rpc_id += 1
+        request_id = self.ble_rpc_id
+        reply = self.base_topic + "/domoticz-" + self.mqttClient.client_id
+        now = time.time()
+        self.ble_pending = {key: item for key, item in self.ble_pending.items() if now - item[2] <= 60}
+        self.ble_pending[request_id] = (gateway, offset, now)
+        if offset == 0:
+            if not hasattr(self, "ble_scan"):
+                self.ble_scan = {}
+            self.ble_scan[gateway] = {"components": {}, "statuses": {}, "revision": None, "total": None, "started": now}
+        payload = {"id": request_id, "src": reply, "method": "Shelly.GetComponents",
+                   "params": {"dynamic_only": True, "include": ["config", "status"], "offset": offset}}
+        self.mqttClient.publish(self.base_topic + "/" + gateway + "/rpc", json.dumps(payload))
+
+    def _discover_ble(self, gateway):
+        if not hasattr(self, "ble_refresh"):
+            self.ble_pending, self.ble_refresh = {}, {}
+        if not hasattr(self, "ble_gateways"):
+            self.ble_gateways = set()
+        self.ble_gateways.add(gateway)
+        now = time.time()
+        if now - self.ble_refresh.get(gateway, 0) < 300:
+            return
+        self.ble_refresh[gateway] = now
+        self._request_ble_components(gateway)
+
     def onMQTTSubscribed(self):
         Domoticz.Debug("onMQTTSubscribed")
+        # Component status is not necessarily retained; refresh known switches after reconnect.
+        for unit in Devices:
+            switch = re.fullmatch(r"(.+)-switch-(0|[1-9][0-9]*)", Devices[unit].DeviceID.strip())
+            if switch:
+                topic = self.base_topic + "/" + switch.group(1) + "/command/switch:" + switch.group(2)
+                self.mqttClient.publish(topic, "status_update")
+            ble = re.fullmatch(r"(.+)-ble-[0-9a-f]{12}-[0-9]+", Devices[unit].DeviceID.strip())
+            if ble:
+                self._discover_ble(ble.group(1))
 
     def onMQTTPublish(self, topic, message): # process incoming MQTT statuses
         def searchdevice( devname ):
@@ -381,7 +447,7 @@ class BasePlugin:
                         break
                 kwargs["Unit"] = iUnit
                 # Create device
-                Domoticz.Log( "Adding device: " + str(unitname) + " parameters: " + str(kwargs))
+                Domoticz.Log( "Adding device: " + str(kwargs.get("Name")) + " parameters: " + str(kwargs))
                 Domoticz.Device( **kwargs ).Create()
             except Exception as e:
                 Domoticz.Error(str(e))
@@ -389,6 +455,193 @@ class BasePlugin:
             return iUnit
            else:
             return -1
+
+        def new_device(unitname, **parameters):
+            iUnit = searchdevice(unitname)
+            if iUnit < 0:
+                # Do not reuse an existing unit when all Domoticz slots are occupied.
+                if not any(unit not in Devices for unit in range(1, 256)):
+                    Domoticz.Error("No free unit for " + unitname)
+                    return
+                # Domoticz enforces its live new-device permission in Create().
+                # Settings may still say 0 during the temporary five-minute permission.
+                if not hasattr(self, "switch_creation_attempts"):
+                    self.switch_creation_attempts = {}
+                now = time.time()
+                if now - self.switch_creation_attempts.get(unitname, 0) < 15:
+                    return
+                self.switch_creation_attempts[unitname] = now
+                iUnit = next(unit for unit in range(1, 256) if unit not in Devices)
+                try:
+                    Domoticz.Log("Creating Shelly device " + unitname)
+                    Domoticz.Device(Name=unitname, Unit=iUnit, Used=1, DeviceID=unitname, **parameters).Create()
+                except Exception as e:
+                    Domoticz.Error("Cannot create " + unitname + ": " + str(e))
+                    return
+                if iUnit not in Devices or Devices[iUnit].DeviceID.strip() != unitname:
+                    Domoticz.Log("Shelly device not created: " + unitname + "; check Domoticz new device permission")
+                    return
+                self.switch_creation_attempts.pop(unitname, None)
+            return iUnit
+
+        def valid_number(value):
+            return type(value) in (int, float) and math.isfinite(value)
+
+        def update_new_switch(device_name, component, state):
+            match = re.fullmatch(r"switch:(0|[1-9][0-9]*)", component)
+            if not match or not isinstance(state, dict):
+                return
+            channel = int(match.group(1))
+            if "id" in state and (type(state["id"]) is not int or state["id"] != channel):
+                return
+            unitname = device_name + "-switch-" + match.group(1)
+            if type(state.get("output")) is bool:
+                iUnit = new_device(unitname, TypeName="Switch")
+                if iUnit is not None:
+                    try:
+                        on = state["output"]
+                        Devices[iUnit].Update(nValue=1 if on else 0, sValue="On" if on else "Off")
+                    except Exception as e:
+                        Domoticz.Error("Cannot update " + unitname + ": " + str(e))
+
+            energy = state.get("aenergy")
+            power = state.get("apower")
+            total = energy.get("total") if isinstance(energy, dict) else None
+            energy_name = unitname + "-energy"
+            energy_unit = searchdevice(energy_name)
+            if valid_number(power) or (valid_number(total) and total >= 0):
+                # Partial notifications can deliver the two fields separately.
+                if not hasattr(self, "switch_measurements"):
+                    self.switch_measurements = {}
+                cached = self.switch_measurements.setdefault(energy_name, {})
+                if valid_number(power):
+                    cached["power"] = power
+                if valid_number(total) and total >= 0:
+                    cached["total"] = total
+                # A new kWh device needs both fields; never invent a counter value.
+                if energy_unit < 0 and "power" in cached and "total" in cached:
+                    energy_unit = new_device(energy_name, TypeName="kWh")
+                if energy_unit is not None and energy_unit >= 0:
+                    try:
+                        previous = Devices[energy_unit].sValue.split(";")
+                        old_power = float(previous[0])
+                        old_total = float(previous[1])
+                        if not math.isfinite(old_power) or not math.isfinite(old_total) or old_total < 0:
+                            raise ValueError("invalid energy state")
+                    except (ValueError, IndexError, TypeError):
+                        old_power = old_total = None
+                    next_power = cached.get("power", old_power)
+                    next_total = cached.get("total", old_total)
+                    if next_power is not None and next_total is not None:
+                        try:
+                            Devices[energy_unit].Update(nValue=0, sValue=str(next_power) + ";" + str(next_total))
+                        except Exception as e:
+                            Domoticz.Error("Cannot update " + energy_name + ": " + str(e))
+
+            for field, suffix, parameters in [
+                ("voltage", "voltage", {"Type": 243, "Subtype": 8}),
+                ("current", "current", {"Type": 243, "Subtype": 23}),
+                ("pf", "pf", {"Type": 243, "Subtype": 31, "Options": {"Custom": "1;PF"}}),
+                ("freq", "frequency", {"Type": 243, "Subtype": 31, "Options": {"Custom": "1;Hz"}}),
+            ]:
+                value = state.get(field)
+                if not valid_number(value):
+                    continue
+                measurement_name = unitname + "-" + suffix
+                iUnit = new_device(measurement_name, **parameters)
+                if iUnit is not None:
+                    try:
+                        Devices[iUnit].Update(nValue=0, sValue=str(value))
+                    except Exception as e:
+                        Domoticz.Error("Cannot update " + measurement_name + ": " + str(e))
+
+            temperature = state.get("temperature")
+            if isinstance(temperature, dict) and valid_number(temperature.get("tC")):
+                measurement_name = unitname + "-temperature"
+                iUnit = new_device(measurement_name, TypeName="Temperature")
+                if iUnit is not None:
+                    try:
+                        Devices[iUnit].Update(nValue=0, sValue=str(temperature["tC"]))
+                    except Exception as e:
+                        Domoticz.Error("Cannot update " + measurement_name + ": " + str(e))
+
+        def update_ble(gateway, component, state, snapshot_started=None):
+            if not isinstance(state, dict):
+                return
+            if not hasattr(self, "ble_values"):
+                self.ble_values = {}
+            if not hasattr(self, "ble_components"):
+                self.ble_components = {}
+            if not hasattr(self, "ble_timestamps"):
+                self.ble_timestamps = {}
+            if not hasattr(self, "ble_arrivals"):
+                self.ble_arrivals = {}
+            arrival_key = (gateway, component)
+            incoming_ts = state.get("last_updated_ts", state.get("last_update_ts"))
+            previous_ts = self.ble_timestamps.get(arrival_key)
+            if snapshot_started is not None and self.ble_arrivals.get(arrival_key, 0) >= snapshot_started:
+                if not (valid_number(incoming_ts) and previous_ts is not None and incoming_ts > previous_ts):
+                    return
+            value = state.get("value")
+            if component.startswith("bthomesensor:"):
+                if "value" in state:
+                    timestamp = state.get("last_updated_ts", state.get("last_update_ts"))
+                    key = (gateway, component)
+                    old_timestamp = self.ble_timestamps.get(key)
+                    if valid_number(timestamp) and old_timestamp is not None and timestamp < old_timestamp:
+                        return
+                    if not valid_number(value) or (timestamp is not None and (not valid_number(timestamp) or timestamp <= 0)):
+                        self.ble_values.pop(key, None)
+                    else:
+                        self.ble_values[key] = value
+                    if valid_number(timestamp) and timestamp > 0:
+                        self.ble_timestamps[key] = timestamp
+                    if snapshot_started is None:
+                        self.ble_arrivals[key] = time.time()
+            if component.startswith("bthomedevice:") and "battery" in state:
+                if snapshot_started is None:
+                    self.ble_arrivals[arrival_key] = time.time()
+                if valid_number(state["battery"]):
+                    self.ble_values[(gateway, component)] = state["battery"]
+                else:
+                    self.ble_values.pop((gateway, component), None)
+            components = self.ble_components.get(gateway, {})
+            addresses = {str(cfg.get("addr", "")).lower() for cfg in components.values()}
+            for addr in addresses:
+                if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", addr):
+                    continue
+                matching = [(key, cfg) for key, cfg in components.items() if str(cfg.get("addr", "")).lower() == addr]
+                temperatures = [key for key, cfg in matching if key.startswith("bthomesensor:") and cfg.get("obj_id") in (2, 69, 87, 88)]
+                humidities = [key for key, cfg in matching if key.startswith("bthomesensor:") and cfg.get("obj_id") in (3, 46)]
+                # Do not guess how multiple sensors on the same BLE device are paired.
+                if len(temperatures) != 1 or len(humidities) != 1:
+                    continue
+                group = {"temperature": self.ble_values.get((gateway, temperatures[0])),
+                         "humidity": self.ble_values.get((gateway, humidities[0]))}
+                batteries = [key for key, cfg in matching if key.startswith("bthomesensor:") and cfg.get("obj_id") == 1]
+                devices = [key for key, cfg in matching if key.startswith("bthomedevice:")]
+                for other in batteries + devices:
+                    battery = self.ble_values.get((gateway, other))
+                    if valid_number(battery) and 0 <= battery <= 100:
+                        group["battery"] = battery
+                        break
+                temp, humidity = group.get("temperature"), group.get("humidity")
+                if not valid_number(temp) or not valid_number(humidity) or not 0 <= humidity <= 100:
+                    continue
+                unitname = gateway + "-ble-" + addr.replace(":", "").lower() + "-0"
+                iUnit = new_device(unitname, TypeName="Temp+Hum")
+                if iUnit is None:
+                    continue
+                try:
+                    values = {"nValue": 0, "sValue": str(temp) + ";" + str(humidity) + ";0"}
+                    battery = group.get("battery")
+                    if valid_number(battery) and 0 <= battery <= 100:
+                        values["BatteryLevel"] = int(battery)
+                    else:
+                        values["BatteryLevel"] = Devices[iUnit].BatteryLevel
+                    Devices[iUnit].Update(**values)
+                except Exception as e:
+                    Domoticz.Error("Cannot update " + unitname + ": " + str(e))
 
         if "/announce" in topic: # announce did not contain any information for us
          return False
@@ -402,19 +655,95 @@ class BasePlugin:
         Domoticz.Debug("MQTT message: " + topic + " " + str(message))
         mqttpath = topic.split('/')
         if (mqttpath[0] == self.base_topic):
-         if self.alive: # if device heartbeat enabled
+         is_ble_reply = topic == self.base_topic + "/domoticz-" + getattr(self.mqttClient, "client_id", "") + "/rpc"
+         if self.alive and not is_ble_reply: # if device heartbeat enabled
            if self._updatedevice(str(mqttpath[1])): # if update needed
                unitname = mqttpath[1]+"-online"
                iUnit = searchdevice(unitname)
                if iUnit<0:
                 devparams = { "Name" : unitname, "Unit": iUnit, "TypeName" :"Switch", "Used":1, "DeviceID" : unitname}
                 iUnit = adddevice(**devparams)
-               if iUnit<0:
-                  return False
-               try:
+               if iUnit>=0:
+                try:
                  Devices[iUnit].Update(nValue=1,sValue="On")
-               except Exception as e:
+                except Exception as e:
                  Domoticz.Debug(str(e))
+
+         # Private RPC replies share the subscribed shellies/# namespace.
+         reply_topic = self.base_topic + "/domoticz-" + getattr(self.mqttClient, "client_id", "") + "/rpc"
+         if topic == reply_topic and isinstance(original_message, dict):
+          pending = getattr(self, "ble_pending", {})
+          entry = pending.get(original_message.get("id"))
+          if entry:
+           gateway, offset, requested_at = entry
+           if original_message.get("src") != gateway:
+            return True
+           if time.time() - requested_at <= 60:
+            pending.pop(original_message["id"], None)
+            result = original_message.get("result")
+            scan = getattr(self, "ble_scan", {}).get(gateway)
+            if original_message.get("error"):
+             Domoticz.Error("BLE discovery failed for " + gateway + ": " + str(original_message["error"]))
+             getattr(self, "ble_scan", {}).pop(gateway, None)
+            if isinstance(result, dict) and scan is not None and result.get("offset") == offset and isinstance(result.get("components"), list) and type(result.get("total")) is int and 0 <= offset <= result["total"]:
+             revision, total = result.get("cfg_rev"), result["total"]
+             if offset == 0:
+              scan["revision"], scan["total"] = revision, total
+             if scan["revision"] != revision or scan["total"] != total:
+              Domoticz.Error("BLE component configuration changed during discovery for " + gateway)
+              self.ble_scan.pop(gateway, None)
+              return True
+             for item in result["components"]:
+              if not isinstance(item, dict):
+               continue
+              key, config, status = item.get("key"), item.get("config"), item.get("status")
+              if isinstance(key, str) and key.startswith(("bthomesensor:", "bthomedevice:")):
+               if not isinstance(config, dict):
+                Domoticz.Error("Invalid BLE component configuration for " + gateway)
+                self.ble_scan.pop(gateway, None)
+                return True
+               scan["components"][key] = config
+               scan["statuses"][key] = status
+             next_offset = offset + len(result["components"])
+             if result["components"] and next_offset < total:
+              self._request_ble_components(gateway, next_offset)
+             elif next_offset != total:
+              Domoticz.Error("Incomplete BLE component list for " + gateway)
+              self.ble_scan.pop(gateway, None)
+             else:
+              self.ble_components = getattr(self, "ble_components", {})
+              old_components = self.ble_components.get(gateway, {})
+              for key, old in old_components.items():
+               new = scan["components"].get(key)
+               if new is None or any(old.get(field) != new.get(field) for field in ("addr", "obj_id", "idx")):
+                for cache in (getattr(self, "ble_values", {}), getattr(self, "ble_timestamps", {}), getattr(self, "ble_arrivals", {})):
+                 cache.pop((gateway, key), None)
+              self.ble_components[gateway] = scan["components"]
+              self.ble_scan.pop(gateway, None)
+              for key, status in scan["statuses"].items():
+               update_ble(gateway, key, status, scan["started"])
+              update_ble(gateway, "", {})
+          return True
+
+         # Gen2 and newer publish component status as JSON, including changes via RPC events.
+         if len(mqttpath) == 4 and mqttpath[2] == "status" and mqttpath[3].startswith(("bthomedevice:", "bthomesensor:")):
+          if isinstance(original_message, dict):
+           update_ble(mqttpath[1], mqttpath[3], original_message)
+           self._discover_ble(mqttpath[1])
+          return True
+         if len(mqttpath) == 4 and mqttpath[2] == "status" and mqttpath[3].startswith("switch:"):
+          if isinstance(original_message, dict):
+           update_new_switch(mqttpath[1], mqttpath[3], original_message)
+          return True
+         if len(mqttpath) == 4 and mqttpath[2:] == ["events", "rpc"] and isinstance(original_message, dict):
+          if original_message.get("method") in ["NotifyStatus", "NotifyFullStatus"]:
+           params = original_message.get("params")
+           if isinstance(params, dict):
+            for component, state in params.items():
+             update_new_switch(mqttpath[1], component, state)
+             if component.startswith(("bthomedevice:", "bthomesensor:")):
+              update_ble(mqttpath[1], component, state)
+              self._discover_ble(mqttpath[1])
 
          forceenergydev = False
          # workaround for Shelly Dimmer energy report routing
